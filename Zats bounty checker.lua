@@ -1,4 +1,4 @@
--- Bounty Checker v6 (Blox Fruits) - live session status to a Discord webhook
+-- Bounty Checker v7 (Blox Fruits) - live session status to a Discord webhook
 -- Fully local: no loadstring, no remote code. Only sends the stats shown in the embed.
 
 repeat task.wait() until game:IsLoaded()
@@ -13,12 +13,33 @@ end
 ----------------------------------------------------------------
 local User = (_G.BountyConfig or {})["Webhook"] or {}
 
+-- Warn about typos in the loader config
+local KNOWN_KEYS = {
+    ["Enabled"] = true, ["Url Webhook"] = true, ["Discord ID"] = true, ["Interval"] = true,
+    ["Edit Message"] = true, ["Ping"] = true, ["Number Style"] = true, ["Ansi Colors"] = true,
+    ["Layout"] = true, ["Show Extras"] = true, ["Show Trend"] = true, ["Trend Points"] = true,
+    ["Recent Events"] = true, ["Persist Session"] = true, ["Resume Window"] = true,
+    ["Min Kill Gain"] = true, ["Milestone Step"] = true, ["Alert Bounty"] = true,
+    ["Idle Minutes"] = true, ["Idle Alert"] = true, ["Bot Name"] = true, ["Bot Avatar"] = true,
+    ["Debug"] = true,
+}
+for key in pairs(User) do
+    if not KNOWN_KEYS[key] then
+        warn("[BountyChecker] Unknown config key: " .. tostring(key))
+    end
+end
+
 local function pickStyle(value)
     value = tostring(value or "both"):lower()
     if value == "full" or value == "short" then
         return value
     end
     return "both"
+end
+
+local function positive(value)
+    value = tonumber(value)
+    return value and value > 0 and value or nil
 end
 
 local Config = {
@@ -28,21 +49,24 @@ local Config = {
     Interval      = math.max(tonumber(User["Interval"]) or 60, 10),       -- seconds, min 10
     EditMessage   = User["Edit Message"] ~= false,     -- edit one message instead of posting new ones
     Ping          = User["Ping"] ~= false,             -- mention you (first message only when editing)
-    NumberStyle   = pickStyle(User["Number Style"]),   -- "both" (6,158,753 (6.16M)), "full" or "short"
+    NumberStyle   = pickStyle(User["Number Style"]),   -- "both", "full" or "short"
     Ansi          = User["Ansi Colors"] ~= false,      -- colored text in code blocks
-    ShowExtras    = User["Show Extras"] ~= false,      -- Level / Beli / server info
+    Compact       = tostring(User["Layout"] or "full"):lower() == "compact", -- "full" or "compact"
+    ShowExtras    = User["Show Extras"] ~= false,      -- Level / Beli
     ShowTrend     = User["Show Trend"] ~= false,       -- sparkline of recent bounty
     TrendPoints   = math.clamp(tonumber(User["Trend Points"]) or 20, 5, 30),
     EventCount    = math.clamp(tonumber(User["Recent Events"]) or 5, 0, 8), -- 0 disables the feed
     Persist       = User["Persist Session"] ~= false,  -- keep stats across server hops (needs writefile)
     ResumeWindow  = tonumber(User["Resume Window"]) or 600,  -- seconds a saved session stays valid
     MinKillGain   = tonumber(User["Min Kill Gain"]) or 1,    -- min bounty gain counted as a kill
-    AlertBounty   = tonumber(User["Alert Bounty"]),          -- optional goal: progress bar, ETA, one-time ping
+    MilestoneStep = positive(User["Milestone Step"]),        -- log an event every N bounty (e.g. 1000000)
+    AlertBounty   = positive(User["Alert Bounty"]),          -- optional goal: progress bar, ETA, one-time ping
     IdleMinutes   = math.max(tonumber(User["Idle Minutes"]) or 10, 1), -- no bounty change for this long = idle
     IdleAlert     = User["Idle Alert"] == true,        -- ping once when idle (off by default)
     BotName       = tostring(User["Bot Name"] or "Bounty Checker"),
     BotAvatar     = tostring(User["Bot Avatar"] or ""),
-    Version       = "v6",
+    Debug         = User["Debug"] == true,
+    Version       = "v7",
 }
 
 if not Config.Enabled then return end
@@ -53,6 +77,12 @@ if Config.Webhook:match("^https://[%w%.]*discord[%w%.]*/api/[v%d/]*webhooks/%d+/
 end
 
 local baseUrl = Config.Webhook:gsub("%?.*$", "")
+
+local function log(...)
+    if Config.Debug then
+        print("[BountyChecker]", ...)
+    end
+end
 
 ----------------------------------------------------------------
 -- Services / executor functions
@@ -152,7 +182,7 @@ local function formatTime(total)
     return string.format("%dh %02dm %02ds", math.floor(total / 3600), math.floor((total % 3600) / 60), total % 60)
 end
 
--- Progress bar, e.g. 0.5 -> ██████░░░░░░
+-- Progress bar, e.g. 0.5 -> ███████░░░░░░░
 local function bar(frac, len)
     len = len or 14
     frac = math.clamp(frac, 0, 1)
@@ -203,6 +233,11 @@ local function row(label, body)
     return colorize(padRight(label, LABEL_W), C.gray) .. body
 end
 
+-- "Label value" pair for compact lines
+local function pair(label, body)
+    return colorize(label .. " ", C.gray) .. body
+end
+
 local function signColor(n)
     if n > 0 then
         return C.green
@@ -224,12 +259,16 @@ local session = {
     kills = 0,
     deaths = 0,
     lastKill = 0,
+    bestKill = 0,
+    streak = 0,
+    bestStreak = 0,
     hops = 0,
     jobId = game.JobId,
     messageId = nil,
     alerted = false,
-    history = {},  -- list of { timestamp, bounty }
-    events = {},   -- list of { ts = timestamp, text = string }
+    history = {},  -- { timestamp, bounty } per update, for the trend line
+    samples = {},  -- { timestamp, bounty } about once a minute, for 15m / 1h windows
+    events = {},   -- { ts = timestamp, text = string }
     lastSeen = os.time(),
 }
 
@@ -240,6 +279,15 @@ local function saveSession()
     pcall(function()
         writefile(SESSION_FILE, HttpService:JSONEncode(session))
     end)
+end
+
+local function loadPairs(source, target)
+    if type(source) ~= "table" then return end
+    for _, p in ipairs(source) do
+        if type(p) == "table" and tonumber(p[1]) and tonumber(p[2]) then
+            target[#target + 1] = { tonumber(p[1]), tonumber(p[2]) }
+        end
+    end
 end
 
 -- Returns resumed, hopped
@@ -259,17 +307,16 @@ local function loadSession()
     session.kills = tonumber(data.kills) or 0
     session.deaths = tonumber(data.deaths) or 0
     session.lastKill = tonumber(data.lastKill) or 0
+    session.bestKill = tonumber(data.bestKill) or 0
+    session.streak = tonumber(data.streak) or 0
+    session.bestStreak = tonumber(data.bestStreak) or 0
     session.hops = tonumber(data.hops) or 0
+    session.milestone = tonumber(data.milestone)
     session.messageId = data.messageId
     session.alerted = data.alerted == true
 
-    if type(data.history) == "table" then
-        for _, p in ipairs(data.history) do
-            if type(p) == "table" and tonumber(p[1]) and tonumber(p[2]) then
-                session.history[#session.history + 1] = { tonumber(p[1]), tonumber(p[2]) }
-            end
-        end
-    end
+    loadPairs(data.history, session.history)
+    loadPairs(data.samples, session.samples)
     if type(data.events) == "table" then
         for _, e in ipairs(data.events) do
             if type(e) == "table" and tonumber(e.ts) and type(e.text) == "string" then
@@ -292,6 +339,18 @@ local function pushHistory(value)
     end
 end
 
+-- One sample per minute, kept for just over an hour
+local function pushSample(value)
+    local now = os.time()
+    local last = session.samples[#session.samples]
+    if not last or now - last[1] >= 60 then
+        table.insert(session.samples, { now, value })
+    end
+    while #session.samples > 0 and now - session.samples[1][1] > 3700 do
+        table.remove(session.samples, 1)
+    end
+end
+
 local function pushEvent(text)
     if Config.EventCount <= 0 then return end
     table.insert(session.events, { ts = os.time(), text = text })
@@ -300,13 +359,18 @@ local function pushEvent(text)
     end
 end
 
--- Average bounty per second over the stored history window
-local function recentRate()
-    local h = session.history
-    if #h < 3 then return nil end
-    local dt = h[#h][1] - h[1][1]
-    if dt < 120 then return nil end
-    return (h[#h][2] - h[1][2]) / dt
+-- Bounty gained over the last `seconds`, or nil if there is not enough data yet
+local function windowGain(seconds, current, now)
+    for _, s in ipairs(session.samples) do
+        if s[1] >= now - seconds then
+            local age = now - s[1]
+            if age >= seconds * 0.8 then
+                return current - s[2], age
+            end
+            return nil
+        end
+    end
+    return nil
 end
 
 ----------------------------------------------------------------
@@ -318,7 +382,7 @@ local resumed, hopped = loadSession()
 local lastBounty = getBounty()
 local lastChangeTime = os.time()
 local idleAlerted = false
-local boundValue, bountyConn, humanoidConn, charConn
+local boundValue, bountyConn, humanoidConn, charConn, teleportConn
 
 local function onBountyChanged(newValue)
     newValue = tonumber(newValue) or 0
@@ -327,14 +391,28 @@ local function onBountyChanged(newValue)
         lastChangeTime = os.time()
         idleAlerted = false
     end
+
     if gain >= Config.MinKillGain then
         session.kills += 1
         session.lastKill = gain
+        session.bestKill = math.max(session.bestKill, gain)
+        session.streak += 1
+        session.bestStreak = math.max(session.bestStreak, session.streak)
         pushEvent("\u{2694}\u{FE0F} Kill " .. signed(gain))
     end
+
     if newValue > session.peak then
         session.peak = newValue
     end
+
+    if Config.MilestoneStep then
+        local level = math.floor(newValue / Config.MilestoneStep)
+        if session.milestone and level > session.milestone then
+            pushEvent("\u{1F3AF} Passed " .. compact(level * Config.MilestoneStep))
+        end
+        session.milestone = math.max(session.milestone or 0, level)
+    end
+
     lastBounty = newValue
 end
 
@@ -361,6 +439,7 @@ local function hookCharacter(char)
     if hum then
         humanoidConn = hum.Died:Connect(function()
             session.deaths += 1
+            session.streak = 0
             pushEvent("\u{1F480} Died")
         end)
     end
@@ -371,6 +450,9 @@ if not session.startBounty then
     session.startBounty = getBounty()
 end
 session.peak = math.max(session.peak, getBounty())
+if Config.MilestoneStep and not session.milestone then
+    session.milestone = math.floor(getBounty() / Config.MilestoneStep)
+end
 
 if not resumed then
     pushEvent("\u{25B6}\u{FE0F} Session started")
@@ -385,11 +467,26 @@ charConn = player.CharacterAdded:Connect(function(char)
     task.spawn(hookCharacter, char)
 end)
 
+-- Save right before a teleport so the next server can resume this session
+teleportConn = player.OnTeleport:Connect(function(state)
+    if state == Enum.TeleportState.Started then
+        saveSession()
+    end
+end)
+
 -- Re-hook if the game rebuilds leaderstats
 task.spawn(function()
     while running do
         hookBounty()
         task.wait(5)
+    end
+end)
+
+-- Frequent autosave so kills and deaths are not lost on a sudden disconnect
+task.spawn(function()
+    while running do
+        task.wait(15)
+        saveSession()
     end
 end)
 
@@ -427,7 +524,7 @@ end
 
 -- Sends a payload. When edit is true and a message exists, edits it instead.
 local function deliver(payload, edit)
-    for _ = 1, 3 do
+    for attempt = 1, 3 do
         local res, err
         if edit and session.messageId then
             res, err = request("PATCH", baseUrl .. "/messages/" .. session.messageId, stripIdentity(payload))
@@ -440,6 +537,7 @@ local function deliver(payload, edit)
             task.wait(5)
         else
             local status = res.StatusCode or res.Status
+            log("HTTP", status, "attempt", attempt)
             if status == 200 or status == 204 then
                 if edit and not session.messageId then
                     local data = decodeBody(res)
@@ -502,8 +600,8 @@ local STATUS_TEXT = {
     stopped = "\u{26AB} Stopped",
 }
 
--- Aligned number table: Bounty / Gain / Peak / Rate / Recent
-local function overviewBlock(current, change, elapsed)
+-- Aligned number table: Bounty / Gain / Peak / Rate / 15m / 1h
+local function overviewBlock(current, change, elapsed, now)
     local rows = {
         { "Bounty", commify(current), compact(current), C.white },
         { "Gain", signed(change), signedShort(change), signColor(change) },
@@ -515,10 +613,13 @@ local function overviewBlock(current, change, elapsed)
         rows[#rows + 1] = { "Rate", signed(perHour) .. "/hr", signedShort(perHour) .. "/hr", signColor(perHour) }
     end
 
-    local recent = recentRate()
-    if recent then
-        local perHour = recent * 3600
-        rows[#rows + 1] = { "Recent", signed(perHour) .. "/hr", signedShort(perHour) .. "/hr", signColor(perHour) }
+    local g15 = windowGain(900, current, now)
+    if g15 then
+        rows[#rows + 1] = { "15 min", signed(g15), signedShort(g15), signColor(g15) }
+    end
+    local g60 = windowGain(3600, current, now)
+    if g60 then
+        rows[#rows + 1] = { "1 hour", signed(g60), signedShort(g60), signColor(g60) }
     end
 
     local widthFull, widthShort = 0, 0
@@ -540,6 +641,27 @@ local function overviewBlock(current, change, elapsed)
         lines[#lines + 1] = row(r[1], body)
     end
     return block(lines)
+end
+
+-- "Faster" / "Slower" / "Steady" comparing the last 15 minutes to the session average
+local function paceText(current, change, elapsed, now)
+    local g15, age = windowGain(900, current, now)
+    if not g15 or elapsed < 900 then return nil end
+    local recent = g15 / age
+    local average = change / elapsed
+    if average <= 0 then
+        if recent > 0 then
+            return colorize(utf8.char(0x25B2) .. " Faster", C.green)
+        end
+        return colorize("= Steady", C.yellow)
+    end
+    local ratio = recent / average
+    if ratio >= 1.1 then
+        return colorize(utf8.char(0x25B2) .. " Faster", C.green)
+    elseif ratio <= 0.9 then
+        return colorize(utf8.char(0x25BC) .. " Slower", C.red)
+    end
+    return colorize("= Steady", C.yellow)
 end
 
 local function buildPayload(status)
@@ -567,41 +689,60 @@ local function buildPayload(status)
 
     local kd = session.kills / math.max(session.deaths, 1)
     local kdColor = (session.deaths == 0 or kd >= 1) and C.green or C.red
+    local kdText = string.format("%.2f", kd)
 
-    local combat = {
-        row("Kills", colorize(tostring(session.kills), C.green)),
-        row("Deaths", colorize(tostring(session.deaths), C.red)),
-        row("K/D", colorize(string.format("%.2f", kd), kdColor)),
-        row("Last", colorize(session.kills > 0 and signedShort(session.lastKill) or "-", C.cyan)),
-    }
+    local fields = { field("\u{1F4CA} Overview", overviewBlock(current, change, elapsed, now), false) }
 
-    local sessionLines = {
-        row("Time", colorize(formatTime(elapsed), C.white)),
-        row("Team", colorize(team, C.white)),
-        row("Server", colorize(#Players:GetPlayers() .. "/" .. Players.MaxPlayers, C.white)),
-    }
-    if session.hops > 0 then
-        sessionLines[#sessionLines + 1] = row("Hops", colorize(tostring(session.hops), C.white))
-    end
-
-    local fields = {
-        field("\u{1F4CA} Overview", overviewBlock(current, change, elapsed), false),
-        field("\u{2694}\u{FE0F} Combat", block(combat), true),
-        field("\u{1F9ED} Session", block(sessionLines), true),
-    }
-
-    if Config.ShowExtras then
-        local level = safeValue(player, "Data", "Level")
-        local beli = safeValue(player, "Data", "Beli")
-        local account = {}
-        if level then
-            account[#account + 1] = row("Level", colorize(commify(level), C.white))
+    if Config.Compact then
+        local killsPerHour = elapsed >= 600 and (session.kills / elapsed * 3600) or nil
+        local line1 = pair("Kills", colorize(tostring(session.kills), C.green))
+            .. "  " .. pair("Deaths", colorize(tostring(session.deaths), C.red))
+            .. "  " .. pair("K/D", colorize(kdText, kdColor))
+        local line2 = pair("Time", colorize(formatTime(elapsed), C.white))
+            .. "  " .. pair("Team", colorize(team, C.white))
+        local lines = { line1, line2 }
+        if killsPerHour then
+            lines[#lines + 1] = pair("Kills/hr", colorize(string.format("%.1f", killsPerHour), C.cyan))
         end
-        if beli then
-            account[#account + 1] = row("Beli", colorize(small(beli), C.yellow))
+        table.insert(fields, field("\u{1F9ED} Stats", block(lines), false))
+    else
+        local combat = {
+            row("Kills", colorize(tostring(session.kills), C.green)),
+            row("Deaths", colorize(tostring(session.deaths), C.red)),
+            row("K/D", colorize(kdText, kdColor)),
+            row("Streak", colorize(session.streak .. " (best " .. session.bestStreak .. ")", C.cyan)),
+            row("Best", colorize(session.bestKill > 0 and signedShort(session.bestKill) or "-", C.cyan)),
+        }
+
+        local sessionLines = {
+            row("Time", colorize(formatTime(elapsed), C.white)),
+            row("Team", colorize(team, C.white)),
+            row("Server", colorize(#Players:GetPlayers() .. "/" .. Players.MaxPlayers, C.white)),
+        }
+        local pace = paceText(current, change, elapsed, now)
+        if pace then
+            sessionLines[#sessionLines + 1] = row("Pace", pace)
         end
-        if #account > 0 then
-            table.insert(fields, field("\u{1F3AE} Account", block(account), true))
+        if session.hops > 0 then
+            sessionLines[#sessionLines + 1] = row("Hops", colorize(tostring(session.hops), C.white))
+        end
+
+        table.insert(fields, field("\u{2694}\u{FE0F} Combat", block(combat), true))
+        table.insert(fields, field("\u{1F9ED} Session", block(sessionLines), true))
+
+        if Config.ShowExtras then
+            local level = safeValue(player, "Data", "Level")
+            local beli = safeValue(player, "Data", "Beli")
+            local account = {}
+            if level then
+                account[#account + 1] = row("Level", colorize(commify(level), C.white))
+            end
+            if beli then
+                account[#account + 1] = row("Beli", colorize(small(beli), C.yellow))
+            end
+            if #account > 0 then
+                table.insert(fields, field("\u{1F3AE} Account", block(account), true))
+            end
         end
     end
 
@@ -637,9 +778,10 @@ local function buildPayload(status)
         table.insert(fields, field("\u{1F4C9} Trend (last " .. #values .. " updates)", block(trend), false))
     end
 
-    if Config.EventCount > 0 and #session.events > 0 then
+    local eventLimit = Config.Compact and math.min(Config.EventCount, 3) or Config.EventCount
+    if eventLimit > 0 and #session.events > 0 then
         local feed = {}
-        for i = #session.events, 1, -1 do
+        for i = #session.events, math.max(#session.events - eventLimit + 1, 1), -1 do
             local e = session.events[i]
             feed[#feed + 1] = e.text .. " \u{2022} <t:" .. e.ts .. ":R>"
         end
@@ -723,7 +865,9 @@ end
 -- Main loop
 ----------------------------------------------------------------
 local function updateOnce()
-    pushHistory(getBounty())
+    local current = getBounty()
+    pushHistory(current)
+    pushSample(current)
     local sent = deliver(buildPayload("running"), Config.EditMessage)
     checkAlerts()
     saveSession()
@@ -769,9 +913,11 @@ _G.BountyChecker = {
         session.startTime = os.time()
         session.startBounty = current
         session.peak = current
-        session.kills, session.deaths, session.lastKill, session.hops = 0, 0, 0, 0
-        session.history, session.events = {}, {}
+        session.kills, session.deaths, session.lastKill, session.bestKill = 0, 0, 0, 0
+        session.streak, session.bestStreak, session.hops = 0, 0, 0
+        session.history, session.samples, session.events = {}, {}, {}
         session.alerted = false
+        session.milestone = Config.MilestoneStep and math.floor(current / Config.MilestoneStep) or nil
         lastChangeTime = os.time()
         pushEvent("\u{1F504} Session reset")
         saveSession()
@@ -782,7 +928,7 @@ _G.BountyChecker = {
         if not running then return end
         running = false
         _G.__BountyCheckerRunning = nil
-        for _, conn in ipairs({ bountyConn, humanoidConn, charConn }) do
+        for _, conn in ipairs({ bountyConn, humanoidConn, charConn, teleportConn }) do
             if conn then
                 conn:Disconnect()
             end
