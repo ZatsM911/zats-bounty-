@@ -48,7 +48,7 @@ local Config = {
     Webhook       = tostring(User["Url Webhook"] or ""),
     DiscordId     = tostring(User["Discord ID"] or ""),
     Interval      = math.max(tonumber(User["Interval"]) or 60, 10),       -- seconds, min 10
-    EditMessage   = User["Edit Message"] ~= false,     -- edit one message instead of posting new ones
+    EditMessage   = User["Edit Message"] == true,      -- off by default: every update is a new message
     Ping          = User["Ping"] ~= false,             -- mention you (first message only when editing)
     NumberStyle   = pickStyle(User["Number Style"]),   -- "both", "full" or "short"
     Ansi          = User["Ansi Colors"] ~= false,      -- colored text in code blocks
