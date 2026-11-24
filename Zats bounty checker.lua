@@ -1,5 +1,5 @@
--- Bounty Checker v3 (Blox Fruits) - live session status to a Discord webhook
--- Fully local: no loadstring, no remote code. Only sends the stats shown below.
+-- Bounty Checker v4 (Blox Fruits) - live session status to a Discord webhook
+-- Fully local: no loadstring, no remote code. Only sends the stats shown in the embed.
 
 repeat task.wait() until game:IsLoaded()
 
@@ -17,21 +17,23 @@ local Config = {
     Enabled       = User["Enabled"] ~= false,
     Webhook       = tostring(User["Url Webhook"] or ""),
     DiscordId     = tostring(User["Discord ID"] or ""),
-    Interval      = math.max(tonumber(User["Interval"]) or 60, 10), -- seconds, min 10
-    EditMessage   = User["Edit Message"] ~= false,   -- edit one message instead of spamming
-    Ping          = User["Ping"] ~= false,           -- mention you (first message only when editing)
-    ShowExtras    = User["Show Extras"] ~= false,    -- Level / Beli / server players
+    Interval      = math.max(tonumber(User["Interval"]) or 60, 10),      -- seconds, min 10
+    EditMessage   = User["Edit Message"] ~= false,    -- edit one message instead of posting new ones
+    Ping          = User["Ping"] ~= false,            -- mention you (first message only when editing)
+    ShowExtras    = User["Show Extras"] ~= false,     -- Level / Beli / server players
+    ShowTrend     = User["Show Trend"] ~= false,      -- sparkline of recent bounty
+    TrendPoints   = math.clamp(tonumber(User["Trend Points"]) or 20, 5, 30),
     Persist       = User["Persist Session"] ~= false, -- keep stats across server hops (needs writefile)
     ResumeWindow  = tonumber(User["Resume Window"]) or 600, -- seconds a saved session stays valid
     MinKillGain   = tonumber(User["Min Kill Gain"]) or 1,   -- min bounty gain counted as a kill
-    AlertBounty   = tonumber(User["Alert Bounty"]),         -- optional: ping once at this bounty
+    AlertBounty   = tonumber(User["Alert Bounty"]),         -- optional goal: progress bar + one-time ping
     BotName       = "Bounty Checker",
-    Title         = "Zats Webhook",
+    Version       = "v4",
 }
 
 if not Config.Enabled then return end
 
-if Config.Webhook:match("^https://[%w%.]*discord[%w%.]*/api/webhooks/%d+/[%w%-_]+") == nil then
+if Config.Webhook:match("^https://[%w%.]*discord[%w%.]*/api/[v%d/]*webhooks/%d+/[%w%-_]+") == nil then
     warn("[BountyChecker] Missing or invalid webhook URL in _G.BountyConfig.")
     return
 end
@@ -67,9 +69,13 @@ local function safeValue(parent, ...)
     return node and node.Value
 end
 
-local function getBounty()
+local function findBountyValue()
     local ls = player:FindFirstChild("leaderstats")
-    local v = ls and (ls:FindFirstChild("Bounty/Honor") or ls:FindFirstChild("Bounty"))
+    return ls and (ls:FindFirstChild("Bounty/Honor") or ls:FindFirstChild("Bounty"))
+end
+
+local function getBounty()
+    local v = findBountyValue()
     return v and tonumber(v.Value) or 0
 end
 
@@ -97,6 +103,32 @@ local function code(text)
     return "`" .. tostring(text) .. "`"
 end
 
+-- Progress bar, e.g. 0.5 -> ██████░░░░░░
+local function bar(frac, len)
+    len = len or 12
+    frac = math.clamp(frac, 0, 1)
+    local filled = math.floor(frac * len + 0.5)
+    return string.rep(utf8.char(0x2588), filled) .. string.rep(utf8.char(0x2591), len - filled)
+end
+
+-- Sparkline from a list of numbers, e.g. ▁▂▄▅▇
+local function sparkline(values)
+    local lo, hi = math.huge, -math.huge
+    for _, v in ipairs(values) do
+        lo = math.min(lo, v)
+        hi = math.max(hi, v)
+    end
+    local out = {}
+    for _, v in ipairs(values) do
+        local idx = 4
+        if hi > lo then
+            idx = math.floor((v - lo) / (hi - lo) * 7 + 0.5) + 1
+        end
+        out[#out + 1] = utf8.char(0x2580 + idx)
+    end
+    return table.concat(out), lo, hi
+end
+
 ----------------------------------------------------------------
 -- Session state (saved to disk so server hops do not reset it)
 ----------------------------------------------------------------
@@ -106,8 +138,10 @@ local session = {
     startTime = os.time(),
     startBounty = nil,
     kills = 0,
+    lastKill = 0,
     messageId = nil,
     alerted = false,
+    history = {},
     lastSeen = os.time(),
 }
 
@@ -129,41 +163,64 @@ local function loadSession()
         session.startTime = tonumber(data.startTime) or session.startTime
         session.startBounty = tonumber(data.startBounty)
         session.kills = tonumber(data.kills) or 0
+        session.lastKill = tonumber(data.lastKill) or 0
         session.messageId = data.messageId
         session.alerted = data.alerted == true
+        if type(data.history) == "table" then
+            session.history = data.history
+        end
     end
 end
 
-_G.BountyChecker = {
-    Stop = function(clearSession)
-        running = false
-        _G.__BountyCheckerRunning = nil
-        if clearSession and type(delfile) == "function" then
-            pcall(delfile, SESSION_FILE)
-        end
-        print("[BountyChecker] Stopped.")
-    end,
-}
+local function pushHistory(value)
+    table.insert(session.history, value)
+    while #session.history > Config.TrendPoints do
+        table.remove(session.history, 1)
+    end
+end
 
+----------------------------------------------------------------
+-- Bounty tracking (event based, re-hooks if leaderstats is rebuilt)
+----------------------------------------------------------------
 player:WaitForChild("leaderstats", 30)
 loadSession()
 
+local lastBounty = getBounty()
+local boundValue, bountyConn
+
+local function onBountyChanged(newValue)
+    newValue = tonumber(newValue) or 0
+    local gain = newValue - lastBounty
+    if gain >= Config.MinKillGain then
+        session.kills += 1
+        session.lastKill = gain
+    end
+    lastBounty = newValue
+end
+
+local function hookBounty()
+    local v = findBountyValue()
+    if v and v ~= boundValue then
+        if bountyConn then
+            bountyConn:Disconnect()
+        end
+        boundValue = v
+        lastBounty = tonumber(v.Value) or 0
+        bountyConn = v:GetPropertyChangedSignal("Value"):Connect(function()
+            onBountyChanged(v.Value)
+        end)
+    end
+end
+
+hookBounty()
 if not session.startBounty then
     session.startBounty = getBounty()
 end
 
-local lastBounty = getBounty()
-local lastReportBounty = lastBounty
-
--- Count a kill whenever bounty rises by at least MinKillGain (approximate)
 task.spawn(function()
     while running do
-        task.wait(1)
-        local b = getBounty()
-        if b - lastBounty >= Config.MinKillGain then
-            session.kills += 1
-        end
-        lastBounty = b
+        hookBounty()
+        task.wait(5)
     end
 end)
 
@@ -226,7 +283,7 @@ local function deliver(payload, edit)
 end
 
 ----------------------------------------------------------------
--- Report
+-- Embed
 ----------------------------------------------------------------
 local function mentionText()
     if Config.Ping and Config.DiscordId ~= "" then
@@ -242,49 +299,86 @@ local function allowedMentions()
     return { parse = {} }
 end
 
-local function buildPayload()
+local function field(name, value, inline)
+    return { name = name, value = value, inline = inline == true }
+end
+
+local function avatarUrl()
+    return "https://www.roblox.com/headshot-thumbnail/image?userId="
+        .. player.UserId .. "&width=150&height=150&format=png"
+end
+
+local function buildPayload(status)
+    status = status or "running"
+    local now = os.time()
     local current = getBounty()
     local change = current - session.startBounty
-    local elapsed = os.time() - session.startTime
+    local elapsed = now - session.startTime
     local team = player.Team and player.Team.Name or "None"
-    local sinceLast = current - lastReportBounty
-    lastReportBounty = current
 
     local rate = "N/A"
     if elapsed >= 60 then
         rate = signed(change / (elapsed / 3600)) .. " / hr"
     end
 
+    local statusText = status == "running" and "\u{1F7E2} Running" or "\u{26AB} Stopped"
+    local description = string.format(
+        "%s\n\u{1F552} Started <t:%d:R>  \u{2022}  Updated <t:%d:R>",
+        statusText, session.startTime, now
+    )
+
     local fields = {
-        { name = "User Account",        value = code(player.Name),          inline = false },
-        { name = "Total Time Run",      value = code(formatTime(elapsed)),  inline = false },
-        { name = "Total Bounty Change", value = code(signed(change)),       inline = true },
-        { name = "Total Kills",         value = code(session.kills .. " Kills"), inline = true },
-        { name = "Bounty Rate",         value = code(rate),                 inline = true },
-        { name = "Since Last Report",   value = code(signed(sinceLast)),    inline = true },
-        { name = "Current Bounty",      value = code(commify(current)),     inline = false },
-        { name = "Current Team",        value = code(team),                 inline = true },
+        field("\u{1F4B0} Bounty",       code(commify(current)),           true),
+        field("\u{1F4C8} Session Gain", code(signed(change)),             true),
+        field("\u{2694}\u{FE0F} Kills", code(session.kills),              true),
+        field("\u{23F1}\u{FE0F} Runtime", code(formatTime(elapsed)),      true),
+        field("\u{1F4CA} Rate",         code(rate),                       true),
+        field("\u{2620}\u{FE0F} Team",  code(team),                       true),
     }
+
+    if session.kills > 0 then
+        table.insert(fields, field("\u{1F3AF} Last Kill", code(signed(session.lastKill)), true))
+    end
 
     if Config.ShowExtras then
         local level = safeValue(player, "Data", "Level")
         local beli = safeValue(player, "Data", "Beli")
         if level then
-            table.insert(fields, { name = "Level", value = code(commify(level)), inline = true })
+            table.insert(fields, field("\u{2B50} Level", code(commify(level)), true))
         end
         if beli then
-            table.insert(fields, { name = "Beli", value = code(commify(beli)), inline = true })
+            table.insert(fields, field("\u{1FA99} Beli", code(commify(beli)), true))
         end
-        table.insert(fields, {
-            name = "Server Players",
-            value = code(#Players:GetPlayers() .. "/" .. Players.MaxPlayers),
-            inline = true,
-        })
+        table.insert(fields, field(
+            "\u{1F310} Server",
+            code(#Players:GetPlayers() .. "/" .. Players.MaxPlayers),
+            true
+        ))
     end
 
-    -- Green when gaining, red when losing, gold when flat
+    if Config.AlertBounty then
+        local frac = current / Config.AlertBounty
+        table.insert(fields, field(
+            "\u{1F3C1} Goal: " .. commify(Config.AlertBounty),
+            code(bar(frac, 14) .. string.format(" %.1f%%", math.clamp(frac, 0, 1) * 100)),
+            false
+        ))
+    end
+
+    if Config.ShowTrend and #session.history >= 2 then
+        local line, lo, hi = sparkline(session.history)
+        table.insert(fields, field(
+            "\u{1F4C9} Trend (last " .. #session.history .. " updates)",
+            code(line) .. "\nlow " .. code(commify(lo)) .. "  high " .. code(commify(hi)),
+            false
+        ))
+    end
+
+    -- Green when gaining, red when losing, gold when flat, gray when stopped
     local color = 16766720
-    if change > 0 then
+    if status ~= "running" then
+        color = 9807270
+    elseif change > 0 then
         color = 5763719
     elseif change < 0 then
         color = 15548997
@@ -295,14 +389,16 @@ local function buildPayload()
         content = mentionText(),
         allowed_mentions = allowedMentions(),
         embeds = {{
-            title = Config.Title,
+            author = {
+                name = player.DisplayName .. " (@" .. player.Name .. ")",
+                icon_url = avatarUrl(),
+            },
+            title = "Bounty Session",
+            description = description,
             color = color,
             fields = fields,
-            thumbnail = {
-                url = "https://www.roblox.com/headshot-thumbnail/image?userId="
-                    .. player.UserId .. "&width=150&height=150&format=png",
-            },
-            footer = { text = "Bounty Checker | updates every " .. Config.Interval .. "s" },
+            thumbnail = { url = avatarUrl() },
+            footer = { text = "Bounty Checker " .. Config.Version .. " | refreshes every " .. Config.Interval .. "s" },
             timestamp = DateTime.now():ToIsoDate(),
         }},
     }
@@ -315,24 +411,33 @@ local function checkAlert()
         session.alerted = true
         request("POST", baseUrl, {
             username = Config.BotName,
-            content = (Config.DiscordId ~= "" and ("<@" .. Config.DiscordId .. "> ") or "")
-                .. "Bounty milestone reached: " .. commify(current),
+            content = Config.DiscordId ~= "" and ("<@" .. Config.DiscordId .. ">") or "",
             allowed_mentions = allowedMentions(),
+            embeds = {{
+                title = "\u{1F3C6} Goal reached",
+                description = player.Name .. " reached " .. code(commify(current)) .. " bounty.",
+                color = 16766720,
+                thumbnail = { url = avatarUrl() },
+                timestamp = DateTime.now():ToIsoDate(),
+            }},
         })
     end
 end
 
+----------------------------------------------------------------
+-- Main loop
+----------------------------------------------------------------
 task.spawn(function()
     while running do
-        local ok, payload = pcall(buildPayload)
-        if ok then
-            deliver(payload, Config.EditMessage)
-        else
-            warn("[BountyChecker] Failed to build report: " .. tostring(payload))
+        local ok, err = pcall(function()
+            pushHistory(getBounty())
+            deliver(buildPayload("running"), Config.EditMessage)
+            checkAlert()
+            saveSession()
+        end)
+        if not ok then
+            warn("[BountyChecker] Update failed: " .. tostring(err))
         end
-
-        checkAlert()
-        saveSession()
 
         local waited = 0
         while running and waited < Config.Interval do
@@ -341,3 +446,27 @@ task.spawn(function()
         end
     end
 end)
+
+----------------------------------------------------------------
+-- Public control
+----------------------------------------------------------------
+_G.BountyChecker = {
+    -- Stop(true) also deletes the saved session
+    Stop = function(clearSession)
+        if not running then return end
+        running = false
+        _G.__BountyCheckerRunning = nil
+        if bountyConn then
+            bountyConn:Disconnect()
+        end
+        pcall(function()
+            deliver(buildPayload("stopped"), Config.EditMessage)
+        end)
+        if clearSession and type(delfile) == "function" then
+            pcall(delfile, SESSION_FILE)
+        else
+            saveSession()
+        end
+        print("[BountyChecker] Stopped.")
+    end,
+}
