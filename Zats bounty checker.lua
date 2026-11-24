@@ -1,4 +1,4 @@
--- Bounty Checker v4 (Blox Fruits) - live session status to a Discord webhook
+-- Bounty Checker v5 (Blox Fruits) - live session status to a Discord webhook
 -- Fully local: no loadstring, no remote code. Only sends the stats shown in the embed.
 
 repeat task.wait() until game:IsLoaded()
@@ -17,18 +17,21 @@ local Config = {
     Enabled       = User["Enabled"] ~= false,
     Webhook       = tostring(User["Url Webhook"] or ""),
     DiscordId     = tostring(User["Discord ID"] or ""),
-    Interval      = math.max(tonumber(User["Interval"]) or 60, 10),      -- seconds, min 10
-    EditMessage   = User["Edit Message"] ~= false,    -- edit one message instead of posting new ones
-    Ping          = User["Ping"] ~= false,            -- mention you (first message only when editing)
-    ShowExtras    = User["Show Extras"] ~= false,     -- Level / Beli / server players
-    ShowTrend     = User["Show Trend"] ~= false,      -- sparkline of recent bounty
+    Interval      = math.max(tonumber(User["Interval"]) or 60, 10),       -- seconds, min 10
+    EditMessage   = User["Edit Message"] ~= false,     -- edit one message instead of posting new ones
+    Ping          = User["Ping"] ~= false,             -- mention you (first message only when editing)
+    ShowExtras    = User["Show Extras"] ~= false,      -- Level / Beli / server info
+    ShowTrend     = User["Show Trend"] ~= false,       -- sparkline of recent bounty
     TrendPoints   = math.clamp(tonumber(User["Trend Points"]) or 20, 5, 30),
-    Persist       = User["Persist Session"] ~= false, -- keep stats across server hops (needs writefile)
-    ResumeWindow  = tonumber(User["Resume Window"]) or 600, -- seconds a saved session stays valid
-    MinKillGain   = tonumber(User["Min Kill Gain"]) or 1,   -- min bounty gain counted as a kill
-    AlertBounty   = tonumber(User["Alert Bounty"]),         -- optional goal: progress bar + one-time ping
-    BotName       = "Bounty Checker",
-    Version       = "v4",
+    Persist       = User["Persist Session"] ~= false,  -- keep stats across server hops (needs writefile)
+    ResumeWindow  = tonumber(User["Resume Window"]) or 600,  -- seconds a saved session stays valid
+    MinKillGain   = tonumber(User["Min Kill Gain"]) or 1,    -- min bounty gain counted as a kill
+    AlertBounty   = tonumber(User["Alert Bounty"]),          -- optional goal: progress bar, ETA, one-time ping
+    IdleMinutes   = math.max(tonumber(User["Idle Minutes"]) or 10, 1), -- no bounty change for this long = idle
+    IdleAlert     = User["Idle Alert"] == true,        -- ping once when idle (off by default)
+    BotName       = tostring(User["Bot Name"] or "Bounty Checker"),
+    BotAvatar     = tostring(User["Bot Avatar"] or ""),
+    Version       = "v5",
 }
 
 if not Config.Enabled then return end
@@ -137,8 +140,12 @@ local SESSION_FILE = "BountyChecker_" .. player.UserId .. ".json"
 local session = {
     startTime = os.time(),
     startBounty = nil,
+    peak = 0,
     kills = 0,
+    deaths = 0,
     lastKill = 0,
+    hops = 0,
+    jobId = game.JobId,
     messageId = nil,
     alerted = false,
     history = {},
@@ -148,6 +155,7 @@ local session = {
 local function saveSession()
     if not (Config.Persist and hasFS) then return end
     session.lastSeen = os.time()
+    session.jobId = game.JobId
     pcall(function()
         writefile(SESSION_FILE, HttpService:JSONEncode(session))
     end)
@@ -162,12 +170,19 @@ local function loadSession()
         and os.time() - data.lastSeen <= Config.ResumeWindow then
         session.startTime = tonumber(data.startTime) or session.startTime
         session.startBounty = tonumber(data.startBounty)
+        session.peak = tonumber(data.peak) or 0
         session.kills = tonumber(data.kills) or 0
+        session.deaths = tonumber(data.deaths) or 0
         session.lastKill = tonumber(data.lastKill) or 0
+        session.hops = tonumber(data.hops) or 0
         session.messageId = data.messageId
         session.alerted = data.alerted == true
         if type(data.history) == "table" then
             session.history = data.history
+        end
+        -- Resuming in a different server counts as a hop
+        if data.jobId ~= game.JobId then
+            session.hops += 1
         end
     end
 end
@@ -180,20 +195,29 @@ local function pushHistory(value)
 end
 
 ----------------------------------------------------------------
--- Bounty tracking (event based, re-hooks if leaderstats is rebuilt)
+-- Tracking: bounty (events), deaths, idle detection
 ----------------------------------------------------------------
 player:WaitForChild("leaderstats", 30)
 loadSession()
 
 local lastBounty = getBounty()
-local boundValue, bountyConn
+local lastChangeTime = os.time()
+local idleAlerted = false
+local boundValue, bountyConn, humanoidConn, charConn
 
 local function onBountyChanged(newValue)
     newValue = tonumber(newValue) or 0
     local gain = newValue - lastBounty
+    if gain ~= 0 then
+        lastChangeTime = os.time()
+        idleAlerted = false
+    end
     if gain >= Config.MinKillGain then
         session.kills += 1
         session.lastKill = gain
+    end
+    if newValue > session.peak then
+        session.peak = newValue
     end
     lastBounty = newValue
 end
@@ -212,11 +236,33 @@ local function hookBounty()
     end
 end
 
+local function hookCharacter(char)
+    if humanoidConn then
+        humanoidConn:Disconnect()
+        humanoidConn = nil
+    end
+    local hum = char:WaitForChild("Humanoid", 10)
+    if hum then
+        humanoidConn = hum.Died:Connect(function()
+            session.deaths += 1
+        end)
+    end
+end
+
 hookBounty()
 if not session.startBounty then
     session.startBounty = getBounty()
 end
+session.peak = math.max(session.peak, getBounty())
 
+if player.Character then
+    task.spawn(hookCharacter, player.Character)
+end
+charConn = player.CharacterAdded:Connect(function(char)
+    task.spawn(hookCharacter, char)
+end)
+
+-- Re-hook if the game rebuilds leaderstats
 task.spawn(function()
     while running do
         hookBounty()
@@ -245,12 +291,23 @@ local function decodeBody(res)
     return ok and type(data) == "table" and data or {}
 end
 
+-- Message edits do not accept a new identity, so drop those fields
+local function stripIdentity(payload)
+    local copy = {}
+    for key, value in pairs(payload) do
+        if key ~= "username" and key ~= "avatar_url" then
+            copy[key] = value
+        end
+    end
+    return copy
+end
+
 -- Sends a payload. When edit is true and a message exists, edits it instead.
 local function deliver(payload, edit)
     for _ = 1, 3 do
         local res, err
         if edit and session.messageId then
-            res, err = request("PATCH", baseUrl .. "/messages/" .. session.messageId, payload)
+            res, err = request("PATCH", baseUrl .. "/messages/" .. session.messageId, stripIdentity(payload))
         else
             res, err = request("POST", baseUrl .. "?wait=true", payload)
         end
@@ -283,7 +340,7 @@ local function deliver(payload, edit)
 end
 
 ----------------------------------------------------------------
--- Embed
+-- Embeds
 ----------------------------------------------------------------
 local function mentionText()
     if Config.Ping and Config.DiscordId ~= "" then
@@ -308,32 +365,62 @@ local function avatarUrl()
         .. player.UserId .. "&width=150&height=150&format=png"
 end
 
+local function withIdentity(payload)
+    payload.username = Config.BotName
+    if Config.BotAvatar ~= "" then
+        payload.avatar_url = Config.BotAvatar
+    end
+    return payload
+end
+
+local STATUS_TEXT = {
+    running = "\u{1F7E2} Running",
+    idle    = "\u{1F7E1} Idle",
+    stopped = "\u{26AB} Stopped",
+}
+
 local function buildPayload(status)
     status = status or "running"
     local now = os.time()
     local current = getBounty()
     local change = current - session.startBounty
     local elapsed = now - session.startTime
+    local idleFor = now - lastChangeTime
     local team = player.Team and player.Team.Name or "None"
 
-    local rate = "N/A"
-    if elapsed >= 60 then
-        rate = signed(change / (elapsed / 3600)) .. " / hr"
+    if status == "running" and idleFor >= Config.IdleMinutes * 60 then
+        status = "idle"
     end
 
-    local statusText = status == "running" and "\u{1F7E2} Running" or "\u{26AB} Stopped"
+    local rate = "N/A"
+    local perSecond = 0
+    if elapsed >= 60 then
+        perSecond = change / elapsed
+        rate = signed(perSecond * 3600) .. " / hr"
+    end
+
+    local statusLine = STATUS_TEXT[status]
+    if status == "idle" then
+        statusLine = statusLine .. " (no change for " .. math.floor(idleFor / 60) .. "m)"
+    end
+
     local description = string.format(
         "%s\n\u{1F552} Started <t:%d:R>  \u{2022}  Updated <t:%d:R>",
-        statusText, session.startTime, now
+        statusLine, session.startTime, now
     )
 
+    local kd = string.format("%.2f", session.kills / math.max(session.deaths, 1))
+
     local fields = {
-        field("\u{1F4B0} Bounty",       code(commify(current)),           true),
-        field("\u{1F4C8} Session Gain", code(signed(change)),             true),
-        field("\u{2694}\u{FE0F} Kills", code(session.kills),              true),
-        field("\u{23F1}\u{FE0F} Runtime", code(formatTime(elapsed)),      true),
-        field("\u{1F4CA} Rate",         code(rate),                       true),
-        field("\u{2620}\u{FE0F} Team",  code(team),                       true),
+        field("\u{1F4B0} Bounty",         code(commify(current)),        true),
+        field("\u{1F4C8} Session Gain",   code(signed(change)),          true),
+        field("\u{1F3D4}\u{FE0F} Peak",   code(commify(session.peak)),   true),
+        field("\u{2694}\u{FE0F} Kills",   code(session.kills),           true),
+        field("\u{1F480} Deaths",         code(session.deaths),          true),
+        field("\u{1F4CA} K/D",            code(kd),                      true),
+        field("\u{23F1}\u{FE0F} Runtime", code(formatTime(elapsed)),     true),
+        field("\u{1F4B9} Rate",           code(rate),                    true),
+        field("\u{2620}\u{FE0F} Team",    code(team),                    true),
     }
 
     if session.kills > 0 then
@@ -354,15 +441,23 @@ local function buildPayload(status)
             code(#Players:GetPlayers() .. "/" .. Players.MaxPlayers),
             true
         ))
+        if session.hops > 0 then
+            table.insert(fields, field("\u{1F501} Server Hops", code(session.hops), true))
+        end
     end
 
     if Config.AlertBounty then
         local frac = current / Config.AlertBounty
-        table.insert(fields, field(
-            "\u{1F3C1} Goal: " .. commify(Config.AlertBounty),
-            code(bar(frac, 14) .. string.format(" %.1f%%", math.clamp(frac, 0, 1) * 100)),
-            false
-        ))
+        local text = bar(frac, 14) .. string.format(" %.1f%%", math.clamp(frac, 0, 1) * 100)
+
+        -- ETA from the average rate of this session
+        local remaining = Config.AlertBounty - current
+        if remaining > 0 and perSecond > 0 and elapsed >= 300 then
+            local eta = remaining / perSecond
+            text = text .. (eta > 360000 and "\nETA: 100h+" or ("\nETA: " .. formatTime(eta)))
+        end
+
+        table.insert(fields, field("\u{1F3C1} Goal: " .. commify(Config.AlertBounty), code(text), false))
     end
 
     if Config.ShowTrend and #session.history >= 2 then
@@ -374,18 +469,19 @@ local function buildPayload(status)
         ))
     end
 
-    -- Green when gaining, red when losing, gold when flat, gray when stopped
+    -- Green: gaining, red: losing, gold: flat, orange: idle, gray: stopped
     local color = 16766720
-    if status ~= "running" then
+    if status == "stopped" then
         color = 9807270
+    elseif status == "idle" then
+        color = 15105570
     elseif change > 0 then
         color = 5763719
     elseif change < 0 then
         color = 15548997
     end
 
-    return {
-        username = Config.BotName,
+    return withIdentity({
         content = mentionText(),
         allowed_mentions = allowedMentions(),
         embeds = {{
@@ -401,26 +497,39 @@ local function buildPayload(status)
             footer = { text = "Bounty Checker " .. Config.Version .. " | refreshes every " .. Config.Interval .. "s" },
             timestamp = DateTime.now():ToIsoDate(),
         }},
-    }
+    })
 end
 
-local function checkAlert()
-    if not Config.AlertBounty or session.alerted then return end
+local function sendAlert(title, text, color)
+    request("POST", baseUrl, withIdentity({
+        content = Config.DiscordId ~= "" and ("<@" .. Config.DiscordId .. ">") or "",
+        allowed_mentions = allowedMentions(),
+        embeds = {{
+            title = title,
+            description = text,
+            color = color,
+            thumbnail = { url = avatarUrl() },
+            timestamp = DateTime.now():ToIsoDate(),
+        }},
+    }))
+end
+
+local function checkAlerts()
     local current = getBounty()
-    if current >= Config.AlertBounty then
+
+    if Config.AlertBounty and not session.alerted and current >= Config.AlertBounty then
         session.alerted = true
-        request("POST", baseUrl, {
-            username = Config.BotName,
-            content = Config.DiscordId ~= "" and ("<@" .. Config.DiscordId .. ">") or "",
-            allowed_mentions = allowedMentions(),
-            embeds = {{
-                title = "\u{1F3C6} Goal reached",
-                description = player.Name .. " reached " .. code(commify(current)) .. " bounty.",
-                color = 16766720,
-                thumbnail = { url = avatarUrl() },
-                timestamp = DateTime.now():ToIsoDate(),
-            }},
-        })
+        sendAlert("\u{1F3C6} Goal reached", player.Name .. " reached " .. code(commify(current)) .. " bounty.", 16766720)
+    end
+
+    local idleFor = os.time() - lastChangeTime
+    if Config.IdleAlert and not idleAlerted and idleFor >= Config.IdleMinutes * 60 then
+        idleAlerted = true
+        sendAlert(
+            "\u{1F7E1} Bounty idle",
+            player.Name .. " has had no bounty change for " .. math.floor(idleFor / 60) .. " minutes.",
+            15105570
+        )
     end
 end
 
@@ -428,19 +537,29 @@ end
 -- Main loop
 ----------------------------------------------------------------
 task.spawn(function()
+    local failStreak = 0
     while running do
-        local ok, err = pcall(function()
+        local ok, result = pcall(function()
             pushHistory(getBounty())
-            deliver(buildPayload("running"), Config.EditMessage)
-            checkAlert()
+            local sent = deliver(buildPayload("running"), Config.EditMessage)
+            checkAlerts()
             saveSession()
+            return sent
         end)
-        if not ok then
-            warn("[BountyChecker] Update failed: " .. tostring(err))
+
+        if ok and result then
+            failStreak = 0
+        else
+            failStreak += 1
+            if not ok then
+                warn("[BountyChecker] Update failed: " .. tostring(result))
+            end
         end
 
+        -- Back off when Discord keeps failing
+        local delay = Config.Interval * (failStreak >= 3 and 2 or 1)
         local waited = 0
-        while running and waited < Config.Interval do
+        while running and waited < delay do
             task.wait(1)
             waited += 1
         end
@@ -456,8 +575,10 @@ _G.BountyChecker = {
         if not running then return end
         running = false
         _G.__BountyCheckerRunning = nil
-        if bountyConn then
-            bountyConn:Disconnect()
+        for _, conn in ipairs({ bountyConn, humanoidConn, charConn }) do
+            if conn then
+                conn:Disconnect()
+            end
         end
         pcall(function()
             deliver(buildPayload("stopped"), Config.EditMessage)
