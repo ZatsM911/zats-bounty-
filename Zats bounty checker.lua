@@ -26,7 +26,7 @@ local Config = {
     MinKillGain   = tonumber(User["Min Kill Gain"]) or 1,   -- min bounty gain counted as a kill
     AlertBounty   = tonumber(User["Alert Bounty"]),         -- optional: ping once at this bounty
     BotName       = "Bounty Checker",
-    Title         = "LIVE SESSION STATUS",
+    Title         = "Zats Webhook",
 }
 
 if not Config.Enabled then return end
